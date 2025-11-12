@@ -51,7 +51,7 @@ def check_website_status(website_url, retries=3):
     for attempt in range(retries):
         try:
             response = requests.get(website_url, timeout=10)
-            return response.status_code == 200
+            return response.status_code < 500
         except requests.RequestException as e:
             logging.warning(f"Error checking website {website_url}: {e}")
             if attempt < retries - 1:
