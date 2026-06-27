@@ -8,6 +8,11 @@ from bson import ObjectId
 import re
 from flask import Flask
 
+# --- NEW IMPORTS ---
+import asyncio
+import aiohttp
+
+
 # Telegram bot token and MongoDB connection details
 BOT_TOKEN = "8120748600:AAHWKZSwocxdaD4d7qchNRO920Z5kQl5q60"
 MONGO_URL = "mongodb+srv://botplays:botplays@vulpix.ffdea.mongodb.net/?retryWrites=true&w=majority&appName=Vulpix"
@@ -42,21 +47,91 @@ logging.basicConfig(
     level=logging.INFO
 )
 
-def check_website_status(website_url, retries=3):
+
+async def fetch_status(session, website):
     """
-    Checks if the website is reachable.
-    Returns True if the website is up, False otherwise.
-    Retries a few times if a network error occurs.
+    Asynchronously checks a single website.
+    Returns a tuple of (website_data, is_up_boolean).
     """
-    for attempt in range(retries):
+    url = website["website_url"]
+    try:
+        # We use a strict 10-second timeout. 
+        # If it doesn't respond by then, we consider it down.
+        async with session.get(url, timeout=10) as response:
+            return website, response.status < 500
+    except Exception as e:
+        logging.warning(f"Error checking website {url}: {e}")
+        return website, False
+
+async def check_all_websites(websites):
+    """
+    Fires off all HTTP requests simultaneously.
+    """
+    async with aiohttp.ClientSession() as session:
+        # Create a concurrent task for every website in the list
+        tasks = [fetch_status(session, w) for w in websites]
+        # Gather and return all results at once
+        return await asyncio.gather(*tasks)
+
+def monitor_websites():
+    """
+    The main monitoring loop running in a background thread.
+    It gathers URLs, uses async to check them instantly, then updates MongoDB.
+    """
+    while True:
         try:
-            response = requests.get(website_url, timeout=10)
-            return response.status_code < 500
-        except requests.RequestException as e:
-            logging.warning(f"Error checking website {website_url}: {e}")
-            if attempt < retries - 1:
-                time.sleep(5)  # Wait before retrying
-    return False
+            websites = list(websites_collection.find())
+            current_time = time.time()
+
+            websites_to_check = [
+                w for w in websites 
+                if current_time - w.get("last_checked_time", 0) >= 60
+            ]
+
+            if websites_to_check:
+                results = asyncio.run(check_all_websites(websites_to_check))
+
+                for website, is_up in results:
+                    chat_id = website["chat_id"]
+                    url = website["website_url"]
+                    last_update_time = website.get("last_update_time", 0)
+                    
+                    # Track if the website was already known to be down
+                    was_down = website.get("is_currently_down", False)
+
+                    # Prepare updates for MongoDB
+                    update_data = {"last_checked_time": current_time}
+
+                    if not is_up:
+                        # Only send alert if it just went down
+                        if not was_down:
+                            send_telegram_message(chat_id, f"⚠️ Alert: The website {url} is down!")
+                            update_data["is_currently_down"] = True
+                    else:
+                        # If it is up, but was previously down, send a recovery message
+                        if was_down:
+                            send_telegram_message(chat_id, f"✅ Recovery: The website {url} is back online!")
+                            update_data["is_currently_down"] = False
+                            update_data["last_update_time"] = current_time
+                        
+                        # Otherwise, just send the 6-hour routine check-in
+                        elif current_time - last_update_time >= 6 * 60 * 60:
+                            send_telegram_message(chat_id, f"✅ Status Update: The website {url} is still up and running!")
+                            update_data["last_update_time"] = current_time
+
+                    # Update the database once per website with the new status
+                    websites_collection.update_one(
+                        {"_id": website["_id"]}, 
+                        {"$set": update_data}
+                    )
+
+            time.sleep(5) 
+            
+        except Exception as e:
+            logging.error(f"Error in monitoring loop: {e}")
+            time.sleep(10)
+
+
 
 def send_telegram_message(chat_id, message):
     """
@@ -210,36 +285,6 @@ def handle_broadcast(message):
         logging.error(f"Error broadcasting message: {e}")
         bot.send_message(chat_id, "An error occurred while broadcasting the message.")
 
-def monitor_websites():
-    """
-    Monitors all websites for all users in the database.
-    Sends alerts or status updates as needed.
-    """
-    while True:
-        try:
-            websites = websites_collection.find()
-            for website in websites:
-                chat_id = website["chat_id"]
-                website_url = website["website_url"]
-                last_checked_time = website.get("last_checked_time", 0)
-                last_update_time = website.get("last_update_time", 0)
-                current_time = time.time()
-
-                # Check website status
-                if current_time - last_checked_time >= 60:  # Check interval: 30 seconds
-                    is_up = check_website_status(website_url)
-                    websites_collection.update_one({"_id": website["_id"]}, {"$set": {"last_checked_time": current_time}})
-
-                    if not is_up:
-                        send_telegram_message(chat_id, f"⚠️ Alert: The website {website_url} is down!")
-                    elif current_time - last_update_time >= 6 * 60 * 60:  # 6-hour update
-                        send_telegram_message(chat_id, f"✅ Status Update: The website {website_url} is up and running!")
-                        websites_collection.update_one({"_id": website["_id"]}, {"$set": {"last_update_time": current_time}})
-
-            time.sleep(5)  # Wait to reduce CPU usage
-        except Exception as e:
-            logging.error(f"Error in monitoring loop: {e}")
-            time.sleep(10)  # Wait before restarting the loop
 
 # Start monitoring in a separate thread
 monitor_thread = Thread(target=monitor_websites)
